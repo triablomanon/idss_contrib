@@ -5,6 +5,9 @@ Provides functions to query Neo4j for PC parts compatibility information.
 """
 import os
 import logging
+import time
+import threading
+from collections import OrderedDict
 from typing import Dict, List, Optional, Any, Tuple
 from dotenv import load_dotenv
 
@@ -54,12 +57,108 @@ PC_PART_TYPES = {
 }
 
 
+class _TTLCache:
+    """
+    Thread-safe TTL (Time-To-Live) + LRU (Least Recently Used) cache.
+
+    This cache stores entries with automatic expiration and size limits.
+    When the cache is full, least recently used entries are evicted.
+    """
+
+    def __init__(self, max_entries: int = 256, entry_ttl_seconds: int = 120):
+        """
+        Initialize the cache.
+
+        Args:
+            max_entries: Maximum number of entries to store
+            entry_ttl_seconds: Time-to-live in seconds for each entry
+        """
+        self.max_entries = max_entries
+        self.entry_ttl_seconds = entry_ttl_seconds
+        # OrderedDict maintains insertion order for LRU eviction
+        self._cache_entries: OrderedDict[str, Tuple[float, Any]] = OrderedDict()
+        self._cache_lock = threading.Lock()
+
+    def get(self, key: str) -> Optional[Any]:
+        """
+        Get a value from the cache.
+
+        Args:
+            key: Cache key
+
+        Returns:
+            Cached value or None if not found/expired
+        """
+        now = time.time()
+        with self._cache_lock:
+            item = self._cache_entries.get(key)
+            if not item:
+                return None
+
+            expires_at, value = item
+
+            # Check if expired
+            if expires_at < now:
+                self._cache_entries.pop(key, None)
+                return None
+
+            # Move to end (most recently used)
+            self._cache_entries.move_to_end(key)
+            return value
+
+    def set(self, key: str, value: Any) -> None:
+        """
+        Store a value in the cache.
+
+        Args:
+            key: Cache key
+            value: Value to store
+        """
+        now = time.time()
+        expires_at = now + self.entry_ttl_seconds
+
+        with self._cache_lock:
+            # Update existing entry
+            if key in self._cache_entries:
+                self._cache_entries.move_to_end(key)
+
+            self._cache_entries[key] = (expires_at, value)
+
+            # Evict oldest entry if over limit (LRU eviction)
+            while len(self._cache_entries) > self.max_entries:
+                self._cache_entries.popitem(last=False)
+
+    def clear(self) -> None:
+        """Clear all cache entries."""
+        with self._cache_lock:
+            self._cache_entries.clear()
+
+
 class Neo4jCompatibilityTool:
-    """Tool for querying Neo4j knowledge graph for compatibility information."""
+    """Tool for querying Neo4j knowledge graph for compatibility information.
+
+    Caching:
+        - Product search results are cached for 120 seconds (TTL) with max 256 entries (LRU eviction)
+        - Compatibility checks are cached for 120 seconds with max 256 entries
+        - Compatible parts queries are cached for 120 seconds with max 256 entries
+    """
+
+    # Class-level caches shared across all instances
+    _PRODUCT_SEARCH_CACHE: Optional[_TTLCache] = None
+    _COMPATIBILITY_CHECK_CACHE: Optional[_TTLCache] = None
+    _COMPATIBLE_PARTS_CACHE: Optional[_TTLCache] = None
 
     def __init__(self):
-        """Initialize Neo4j connection."""
+        """Initialize Neo4j connection and caches."""
         self.driver = None
+
+        # Initialize class-level caches (only once)
+        if Neo4jCompatibilityTool._PRODUCT_SEARCH_CACHE is None:
+            Neo4jCompatibilityTool._PRODUCT_SEARCH_CACHE = _TTLCache(max_entries=256, entry_ttl_seconds=120)
+            Neo4jCompatibilityTool._COMPATIBILITY_CHECK_CACHE = _TTLCache(max_entries=256, entry_ttl_seconds=120)
+            Neo4jCompatibilityTool._COMPATIBLE_PARTS_CACHE = _TTLCache(max_entries=256, entry_ttl_seconds=120)
+            logger.info("Initialized Neo4j query caches (256 entries, 120s TTL)")
+
         self._connect()
 
     def _connect(self) -> None:
@@ -94,6 +193,8 @@ class Neo4jCompatibilityTool:
         """
         Find a product in the knowledge graph by name (fuzzy matching).
 
+        Results are cached for 120 seconds (TTL) with max 256 entries (LRU eviction).
+
         Args:
             product_name: Product name to search for
             product_type: Optional product type filter
@@ -103,6 +204,18 @@ class Neo4jCompatibilityTool:
         """
         if not self.is_available():
             return None
+
+        # Generate cache key
+        cache_key = f"find_product:{product_name.lower()}:{product_type or 'any'}"
+
+        # Check cache
+        assert self._PRODUCT_SEARCH_CACHE is not None
+        cached_result = self._PRODUCT_SEARCH_CACHE.get(cache_key)
+        if cached_result is not None:
+            logger.info(f"Neo4j product search cache HIT: {product_name} ({product_type or 'any type'})")
+            return cached_result
+
+        logger.info(f"Neo4j product search cache MISS: {product_name} ({product_type or 'any type'})")
 
         try:
             with self.driver.session() as session:
@@ -116,7 +229,10 @@ class Neo4jCompatibilityTool:
                 result = session.run(query, slug=slug)
                 record = result.single()
                 if record:
-                    return dict(record["p"])
+                    product_data = dict(record["p"])
+                    # Cache the result
+                    self._PRODUCT_SEARCH_CACHE.set(cache_key, product_data)
+                    return product_data
 
                 # Try fuzzy name matching
                 query = """
@@ -139,21 +255,28 @@ class Neo4jCompatibilityTool:
                 records = list(result)
                 if records:
                     # Return the first match (could be improved with better ranking)
-                    return dict(records[0]["p"])
+                    product_data = dict(records[0]["p"])
+                    # Cache the result
+                    self._PRODUCT_SEARCH_CACHE.set(cache_key, product_data)
+                    return product_data
 
+                # Cache None result (avoid repeated failed lookups)
+                self._PRODUCT_SEARCH_CACHE.set(cache_key, None)
                 return None
         except Exception as e:
             logger.error(f"Error finding product: {e}")
             return None
 
     def check_compatibility(
-        self, 
-        part1_slug: str, 
-        part2_slug: str, 
+        self,
+        part1_slug: str,
+        part2_slug: str,
         compatibility_types: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
         Check if two parts are compatible.
+
+        Results are cached for 120 seconds (TTL) with max 256 entries (LRU eviction).
 
         Args:
             part1_slug: Slug of first product
@@ -168,6 +291,20 @@ class Neo4jCompatibilityTool:
                 "compatible": False,
                 "error": "Neo4j connection unavailable"
             }
+
+        # Generate cache key (normalized to handle bidirectional compatibility)
+        slugs_sorted = tuple(sorted([part1_slug.lower(), part2_slug.lower()]))
+        compat_types_key = ",".join(sorted(compatibility_types)) if compatibility_types else "auto"
+        cache_key = f"compat:{slugs_sorted[0]}::{slugs_sorted[1]}::{compat_types_key}"
+
+        # Check cache
+        assert self._COMPATIBILITY_CHECK_CACHE is not None
+        cached_result = self._COMPATIBILITY_CHECK_CACHE.get(cache_key)
+        if cached_result is not None:
+            logger.info(f"Neo4j compatibility check cache HIT: {part1_slug} <-> {part2_slug}")
+            return cached_result
+
+        logger.info(f"Neo4j compatibility check cache MISS: {part1_slug} <-> {part2_slug}")
 
         try:
             with self.driver.session() as session:
@@ -201,10 +338,14 @@ class Neo4jCompatibilityTool:
                         compatibility_types = PART_COMPATIBILITY_MAP.get(key, [])
 
                 if not compatibility_types:
-                    return {
+                    error_result = {
                         "compatible": False,
                         "error": f"Compatibility checking not supported for {type1} and {type2}"
                     }
+                    # Cache this result to avoid repeated lookups
+                    assert self._COMPATIBILITY_CHECK_CACHE is not None
+                    self._COMPATIBILITY_CHECK_CACHE.set(cache_key, error_result)
+                    return error_result
 
                 # Check each compatibility type (bidirectional - compatibility is symmetric)
                 found_types = []
@@ -247,13 +388,22 @@ class Neo4jCompatibilityTool:
                     "part2_name": name2
                 }
                 logger.info(f"[KG Result] Compatibility check complete: {name1} <-> {name2} = {compatible} (types: {found_types})")
+
+                # Cache the result
+                assert self._COMPATIBILITY_CHECK_CACHE is not None
+                self._COMPATIBILITY_CHECK_CACHE.set(cache_key, result_data)
+
                 return result_data
         except Exception as e:
             logger.error(f"Error checking compatibility: {e}")
-            return {
+            error_result = {
                 "compatible": False,
                 "error": str(e)
             }
+            # Cache error results too (avoid repeated failed queries)
+            assert self._COMPATIBILITY_CHECK_CACHE is not None
+            self._COMPATIBILITY_CHECK_CACHE.set(cache_key, error_result)
+            return error_result
 
     def find_compatible_parts(
         self,
@@ -264,6 +414,8 @@ class Neo4jCompatibilityTool:
     ) -> List[Dict[str, Any]]:
         """
         Find parts compatible with a source part.
+
+        Results are cached for 120 seconds (TTL) with max 256 entries (LRU eviction).
 
         Args:
             source_slug: Slug of source product
@@ -277,6 +429,19 @@ class Neo4jCompatibilityTool:
         if not self.is_available():
             return []
 
+        # Generate cache key
+        compat_type_key = compatibility_type or "auto"
+        cache_key = f"find_compat:{source_slug.lower()}:{target_type.lower()}:{compat_type_key}:limit{limit}"
+
+        # Check cache
+        assert self._COMPATIBLE_PARTS_CACHE is not None
+        cached_result = self._COMPATIBLE_PARTS_CACHE.get(cache_key)
+        if cached_result is not None:
+            logger.info(f"Neo4j find compatible parts cache HIT: {source_slug} -> {target_type} ({len(cached_result)} results)")
+            return cached_result
+
+        logger.info(f"Neo4j find compatible parts cache MISS: {source_slug} -> {target_type}")
+
         try:
             with self.driver.session() as session:
                 # Get source product type
@@ -287,6 +452,9 @@ class Neo4jCompatibilityTool:
                 result = session.run(query, slug=source_slug)
                 record = result.single()
                 if not record:
+                    # Cache empty result (source product not found)
+                    assert self._COMPATIBLE_PARTS_CACHE is not None
+                    self._COMPATIBLE_PARTS_CACHE.set(cache_key, [])
                     return []
 
                 source_type = record["source_type"]
@@ -301,6 +469,9 @@ class Neo4jCompatibilityTool:
                         key = (target_type, source_type)
                         types = PART_COMPATIBILITY_MAP.get(key, [])
                     if not types:
+                        # Cache empty result (no compatibility mapping)
+                        assert self._COMPATIBLE_PARTS_CACHE is not None
+                        self._COMPATIBLE_PARTS_CACHE.set(cache_key, [])
                         return []
                     compatibility_type = types[0]  # Use first matching type
 
@@ -329,9 +500,17 @@ class Neo4jCompatibilityTool:
                 logger.info(f"[KG Result] Found {len(products)} compatible {target_type} parts for {source_slug}")
                 if products:
                     logger.debug(f"[KG Result] Products: {[p.get('name', 'Unknown') for p in products[:5]]}")
+
+                # Cache the result
+                assert self._COMPATIBLE_PARTS_CACHE is not None
+                self._COMPATIBLE_PARTS_CACHE.set(cache_key, products)
+
                 return products
         except Exception as e:
             logger.error(f"Error finding compatible parts: {e}")
+            # Cache empty result (avoid repeated failed queries)
+            assert self._COMPATIBLE_PARTS_CACHE is not None
+            self._COMPATIBLE_PARTS_CACHE.set(cache_key, [])
             return []
 
     def get_product_info(self, slug: str) -> Optional[Dict[str, Any]]:
