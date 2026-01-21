@@ -4,7 +4,7 @@ Interview workflow - asks questions to understand user needs before making recom
 This workflow runs until the interview is complete (threshold reached or user requests products).
 """
 import os
-from typing import Any, Optional, Callable
+from typing import Any, Dict, Optional, Callable
 from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -24,6 +24,60 @@ from idss_agent.processing.recommendation import update_recommendation_list
 from idss_agent.agents.discovery import discovery_agent
 
 logger = get_logger("workflows.interview")
+
+
+# This defines the "Must Have" fields for each component type.
+REQUIRED_SPECS_MAP = {
+    "gpu": ["price", "target_resolution", "recommended_psu"],
+    "graphics card": ["price", "target_resolution", "recommended_psu"],
+    "cpu": ["price", "primary_use_case", "socket"],
+    "processor": ["price", "primary_use_case", "socket"],
+    "motherboard": ["socket", "form_factor", "wifi"],
+    "monitor": ["target_resolution", "screen_size", "price"],
+    # Fallback for unknown or full builds
+    "default": ["part_type", "price", "primary_use_case"]
+}
+
+def get_missing_requirements(filters: Dict[str, Any]) -> list[str]:
+    """
+    Compare current filters against strict requirements to find what's missing.
+    """
+    # 1. Determine the category (default to "default" if unknown)
+    part_type = filters.get("part_type", "").lower()
+    
+    # Handle broad categories or synonyms if needed
+    if not part_type:
+        required_fields = REQUIRED_SPECS_MAP["default"]
+    else:
+        # Fuzzy match or direct lookup
+        required_fields = REQUIRED_SPECS_MAP.get(part_type, REQUIRED_SPECS_MAP["default"])
+
+    # 2. Check what is missing
+    missing = []
+    for field in required_fields:
+        # specialized check for price since it maps to price_min/max/range
+        if field == "price":
+            if not (filters.get("price") or filters.get("price_max")):
+                missing.append("Budget / Price Range")
+        elif field not in filters or not filters[field]:
+            # Convert snake_case to Human Readable
+            human_readable = field.replace("_", " ").title()
+            missing.append(human_readable)
+            
+    return missing
+
+def format_known_info(filters: Dict[str, Any]) -> str:
+    """Format known filters for the prompt to prevent redundancy."""
+    if not filters:
+        return "Nothing explicitly known yet."
+    
+    lines = []
+    for k, v in filters.items():
+        if v:
+            lines.append(f"- {k.replace('_', ' ').title()}: {v}")
+    return "\n".join(lines)
+
+
 
 # Structured output schema for interview mode
 class InterviewResponse(BaseModel):
@@ -115,21 +169,27 @@ def interview_node(state: ProductSearchState) -> ProductSearchState:
 
     user_input = get_latest_user_message(state)
 
-    if not user_input:
-        # First turn - greeting
-        state["ai_response"] = "Hi there! Welcome. What brings you in today? Are you looking to upgrade your current setup or building something new?"
-        state["quick_replies"] = ["Upgrading current", "Building new", "Adding components", "Just exploring"]
-        state["suggested_followups"] = []  # Interview mode doesn't use suggested followups
+    # Gap Analysis Logic 
+    current_filters = state.get("explicit_filters", {})
+    
+    # 1. Calculate Gaps
+    missing_info_list = get_missing_requirements(current_filters)
+    known_info_str = format_known_info(current_filters)
+    missing_info_str = ", ".join(missing_info_list) if missing_info_list else "None - ready to recommend"
+
+    # 2. Smart Greeting / First Turn Logic
+    # If it's the first turn BUT we already extracted a part type (e.g. "I want a GPU"),
+    # we skip the generic greeting and go straight to specific questions.
+    is_first_turn = not user_input
+    has_specific_intent = "part_type" in current_filters
+    
+    if is_first_turn and not has_specific_intent:
+        # True Cold Start: We know nothing.
+        state["ai_response"] = "Hi! I can help you find PC parts. Are you building a new PC from scratch, or upgrading a specific component?"
+        state["quick_replies"] = ["Building New PC", "Upgrading Component", "Just Browsing"]
         state["_interview_should_end"] = False
-
-        # Emit progress: Interview question ready
         if progress_callback:
-            progress_callback({
-                "step_id": "interview_questions",
-                "description": "Interview question ready",
-                "status": "completed"
-            })
-
+            progress_callback({"step_id": "interview_questions", "status": "completed"})
         return state
 
     # Get configuration
@@ -145,46 +205,38 @@ def interview_node(state: ProductSearchState) -> ProductSearchState:
     )
     structured_llm = llm.with_structured_output(InterviewResponse)
 
-    # Load system prompt from template
-    system_prompt = render_prompt('interview_system.j2')
+    system_prompt = render_prompt(
+        'interview_system.j2',
+        extra_context={
+            'known_info_summary': known_info_str,
+            'missing_critical_info': missing_info_str
+        }
+    )
+    
     messages = [SystemMessage(content=system_prompt)]
-
-    # Limit conversation history to prevent context explosion
+    
+    # Add history
     conversation_history = state["conversation_history"]
     if len(conversation_history) > max_history:
         conversation_history = conversation_history[-max_history:]
-
     messages.extend(conversation_history)
 
-    # Get structured response
+    # 4. Invoke
     response: InterviewResponse = structured_llm.invoke(messages)
 
-    # Store decision
+    # 5. Logic Check: If no missing info, force end (unless LLM disagrees strongly)
+    if not missing_info_list and len(conversation_history) > 2:
+        logger.info("Gap analysis shows all critical info gathered. Encouraging end of interview.")
+
     state["_interview_should_end"] = response.should_end
-
-    if response.should_end:
-        logger.info("LLM decided to end interview")
-        state["ai_response"] = ""
-        state["quick_replies"] = None
-        state["suggested_followups"] = []
-        state["comparison_table"] = None
-    else:
-        # Normal conversation - set the response and interactive elements
-        state["ai_response"] = response.ai_response
-        # Apply feature flag for quick_replies
-        state["quick_replies"] = response.quick_replies if config.features.get('enable_quick_replies', True) else None
-        state["suggested_followups"] = []  # Interview mode doesn't use suggested followups
-        state["comparison_table"] = None  # Clear comparison table in interview mode
-
-    # Emit progress: Interview question ready
+    state["ai_response"] = response.ai_response
+    state["quick_replies"] = response.quick_replies if config.features.get('enable_quick_replies', True) else None
+    
     if progress_callback:
-        progress_callback({
-            "step_id": "interview_questions",
-            "description": "Interview question ready",
-            "status": "completed"
-        })
+        progress_callback({"step_id": "interview_questions", "status": "completed"})
 
     return state
+
 
 
 def make_initial_recommendation(state: ProductSearchState) -> ProductSearchState:
